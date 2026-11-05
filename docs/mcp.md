@@ -35,6 +35,37 @@ as a pre-dispatch refusal (for example, too many control connections); the next 
 
 Logs go to stderr; stdout carries only protocol messages.
 
+### Confining file access
+
+`--automation-read-root DIR` and `--automation-write-root DIR` (each repeatable, headless only; as in
+PhotoCraft, EffectCraft and FilmCraft) confine the files an agent may reach: it reads only inside a read
+or write root and writes only inside a write root. Without them the server reads and writes wherever
+the user can. With them (`crates/mcp/src/confine.rs`):
+
+- every command is checked before it runs (`command_run`, `command_batch` steps, `cmd_*` tools and the
+  helpers): its file parameters must be absolute paths inside the roots (no `..`, symbolic links
+  resolved), and any other absolute path among its parameters is checked as a read;
+- `export` / `app.export` needs `path` or `dir` (after its export preset is applied) inside a write
+  root; `destinationMode: "sameAsOriginal"` needs the photos' originals inside one;
+- commands that write the photos' own files or files next to them (`photo.saveMetadataToFile`,
+  `photo.duplicate`, `photo.convertToDng`, `photo.rename`, `photo.moveToFolder`, `merge.*`,
+  `library.retrySidecars`) need those originals inside a write root, and `import` with `mode: "move"`
+  its sources;
+- `photo.editExternal` (opens another application) and turning on automatic XMP sidecars are refused,
+  and the server does not start confined on a library that writes sidecars automatically;
+- `--library` must be inside a write root and FILES inside a read or write root;
+- photos are decoded only inside the roots, so photos a library already references elsewhere render
+  as unavailable.
+
+The app's own data folder (presets, templates, models, the lens database) stays writable. Commands
+that read metadata from, or copy, the originals a library already references (`format: "original"`)
+are not checked against the roots. `--connect` with a root is refused: the desktop app reads and
+writes as the user.
+
+```sh
+lightcraft-cli mcp --library ~/work/lib --automation-read-root ~/Pictures/shoot --automation-write-root ~/work
+```
+
 ## Wiring it into a client
 
 Build once: `cargo build --release -p lightcraft-cli` (binary: `target/release/lightcraft-cli`).

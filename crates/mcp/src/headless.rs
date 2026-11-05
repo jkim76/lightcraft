@@ -2,6 +2,7 @@
 //! MCP server (and the CLI) work without a window.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use lightcraft_engine::Session;
 use lightcraft_engine::catalog::PhotoId;
@@ -9,11 +10,14 @@ use lightcraft_raster::Rgba8;
 use serde_json::{Value, json};
 
 use crate::backend::{Backend, ProgressHook};
+use crate::confine::{Access, Confinement};
 
 /// Headless backend: a [`Session`] with filesystem hooks.
 pub struct Headless {
     pub session: Session,
     progress: Option<ProgressHook>,
+    /// File access confinement (`--automation-read-root` / `--automation-write-root`).
+    confine: Option<Arc<Confinement>>,
 }
 
 impl Drop for Headless {
@@ -38,7 +42,28 @@ impl Default for Headless {
 
 impl Headless {
     pub fn new(session: Session) -> Self {
-        Self { session, progress: None }
+        Self { session, progress: None, confine: None }
+    }
+
+    /// Confine the files agents may read and write to `c`'s roots (see [`crate::confine`]):
+    /// every command is checked before it runs, and the photo decoders read only inside the
+    /// roots. Refused while the open library writes XMP sidecars automatically, which would
+    /// write next to every edited original wherever it is.
+    pub fn confine(&mut self, c: Confinement) -> Result<(), String> {
+        if self.session.xmp.auto_write {
+            return Err("this library writes XMP sidecars automatically (next to every edited original); turn that off \
+                 (library.xmpPreferences {autoWrite: false}) before confining file access"
+                .into());
+        }
+        let c = Arc::new(c);
+        c.confine_loaders(&mut self.session);
+        self.confine = Some(c);
+        Ok(())
+    }
+
+    /// The confinement in force, if any.
+    pub fn confinement(&self) -> Option<&Confinement> {
+        self.confine.as_deref()
     }
 
     /// A headless session with the procedurally generated demo library.
@@ -64,6 +89,10 @@ impl Headless {
     fn export(&mut self, p: &Value) -> Result<Value, String> {
         use lightcraft_engine::export::{Destination, ExportFormat, ExportOptions, Resize, prepare_batch, run_batch};
         let p = &self.session.export_params_or(p, ExportFormat::Png)?;
+        // checked after the export preset is applied: a preset can name the destination
+        if let Some(c) = &self.confine {
+            c.check_export(&self.session, p)?;
+        }
         // PNG for a `path` that names no format; `bitDepth` is checked against the format written
         let mut opts = ExportOptions::from_params_or(p, ExportFormat::Png).map_err(|e| e.to_string())?;
         if !ExportOptions::has_size_param(p) {
@@ -129,6 +158,9 @@ impl Backend for Headless {
                 if id == "app.export" {
                     return self.export(&params);
                 }
+                if let Some(c) = &self.confine {
+                    c.check_command(&self.session, id, &params)?;
+                }
                 self.session.execute(id, &params).map_err(|e| e.to_string())
             }
             "engine.commands" => {
@@ -142,6 +174,9 @@ impl Backend for Headless {
                 let img = self.render(&p, 1600)?;
                 match p.get("path").and_then(Value::as_str) {
                     Some(path) => {
+                        if let Some(c) = &self.confine {
+                            c.check_path("`path`", path, Access::Write)?;
+                        }
                         self.session.check_write_target(path)?;
                         write_image(Path::new(path), &img, 92)?;
                         Ok(json!({"path": path, "width": img.width, "height": img.height}))
@@ -159,6 +194,13 @@ impl Backend for Headless {
 
     fn has_ui(&self) -> bool {
         false
+    }
+
+    fn check_paths(&self, paths: &[String], access: Access) -> Result<(), String> {
+        match &self.confine {
+            Some(c) => paths.iter().try_for_each(|p| c.check_path("`paths`:", p, access)),
+            None => Ok(()),
+        }
     }
 
     fn describe(&self) -> String {

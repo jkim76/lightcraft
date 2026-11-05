@@ -602,3 +602,100 @@ fn render_and_screenshot_pngs_go_through_a_private_folder() {
         folders.push(dir);
     }
 }
+
+/// A folder tree for the confinement tests: `in` (read root), `out` (write root), `other`
+/// (neither), each with a small PNG photo.
+fn confined_fixture(tag: &str) -> (std::path::PathBuf, Headless) {
+    let base = std::env::temp_dir().join(format!("lc-mcp-confine-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let img = lightcraft_raster::Rgba8 { width: 8, height: 8, data: vec![[200, 90, 30, 255]; 64] };
+    let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+    for d in ["in", "out", "other"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+        std::fs::write(base.join(d).join("p.png"), &png).unwrap();
+    }
+    let base = base.canonicalize().unwrap();
+    let mut h = Headless::default();
+    h.confine(crate::Confinement::new(&[base.join("in")], &[base.join("out")]).unwrap()).unwrap();
+    (base, h)
+}
+
+fn s(p: &std::path::Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// `--automation-read-root/--automation-write-root`: imports and exports work inside the roots,
+/// and every way out of them is refused before anything is read or written.
+#[test]
+fn confined_headless_stays_inside_the_roots() {
+    let (base, mut h) = confined_fixture("roots");
+    // import: inside a read root yes, elsewhere no (also not by folder listing)
+    let r = call_tool(&mut h, "import", &json!({"paths": [s(&base.join("in/p.png"))]}));
+    assert!(!r.is_error, "{r:?}");
+    for outside in [s(&base.join("other/p.png")), s(&base.join("other")), s(&base.join("in/../other/p.png")), "/etc/hostname".into()] {
+        let r = call_tool(&mut h, "import", &json!({"paths": [outside]}));
+        assert!(r.is_error, "{outside}: {r:?}");
+        let r = call_tool(&mut h, "command_run", &json!({"id": "library.import", "params": {"paths": [outside]}}));
+        assert!(r.is_error && r.to_value().to_string().contains("file access is confined"), "{outside}: {r:?}");
+    }
+    // a move would remove sources from the read root
+    let r = call_tool(&mut h, "import", &json!({"paths": [s(&base.join("in/p.png"))], "mode": "move", "destination": s(&base.join("out"))}));
+    assert!(r.is_error, "{r:?}");
+    // export: into a write root yes; into the read root, elsewhere, relative or without a destination no
+    let r = call_tool(&mut h, "export", &json!({"path": s(&base.join("out/e.jpg")), "longEdge": 8}));
+    assert!(!r.is_error, "{r:?}");
+    assert!(base.join("out/e.jpg").is_file());
+    for args in [json!({"path": s(&base.join("in/e.jpg"))}), json!({"dir": s(&base.join("other"))}), json!({"path": "e.jpg"}), json!({})] {
+        let r = call_tool(&mut h, "export", &args);
+        assert!(r.is_error, "{args}: {r:?}");
+    }
+    assert!(!base.join("in/e.jpg").exists() && !base.join("other/e.jpg").exists());
+    // other writers, nested paths, sidecars next to originals in the read root, other apps
+    for (id, params) in [
+        ("preset.export", json!({"path": s(&base.join("other/x.lcpreset"))})),
+        ("slideshow.overlays", json!({"identityPlate": {"image": s(&base.join("other/p.png"))}})),
+        ("photo.saveMetadataToFile", json!({})),
+        ("photo.duplicate", json!({})),
+        ("photo.editExternal", json!({"dir": s(&base.join("out"))})),
+        ("library.xmpPreferences", json!({"autoWrite": true})),
+        ("library.toggleAutoWriteXmp", json!({})),
+    ] {
+        let r = call_tool(&mut h, "command_run", &json!({"id": id, "params": params}));
+        assert!(r.is_error && r.to_value().to_string().contains("file access is confined"), "{id}: {r:?}");
+    }
+    assert!(!base.join("in/p.xmp").exists() && !base.join("in/p-copy.png").exists());
+    // a writer inside the write root still works
+    let r = call_tool(&mut h, "command_run", &json!({"id": "preset.export", "params": {"path": s(&base.join("out/x.lcpreset"))}}));
+    assert!(!r.to_value().to_string().contains("file access is confined"), "{r:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A confined session decodes photos only inside the roots, even ones a library already had.
+#[test]
+fn confined_headless_does_not_decode_photos_outside_the_roots() {
+    let base = std::env::temp_dir().join(format!("lc-mcp-confine-decode-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("in")).unwrap();
+    std::fs::create_dir_all(base.join("other")).unwrap();
+    let img = lightcraft_raster::Rgba8 { width: 8, height: 8, data: vec![[10, 200, 30, 255]; 64] };
+    let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+    std::fs::write(base.join("other/p.png"), &png).unwrap();
+    let base = base.canonicalize().unwrap();
+    let mut h = Headless::default();
+    // imported before the confinement, as a library opened with --library could hold it
+    let r = call_tool(&mut h, "import", &json!({"paths": [s(&base.join("other/p.png"))]}));
+    assert!(!r.is_error, "{r:?}");
+    h.confine(crate::Confinement::new(&[base.join("in")], &[]).unwrap()).unwrap();
+    let r = h.call("ui.render", json!({"size": 8}));
+    assert!(r.is_err(), "{r:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Confinement is refused while the library writes sidecars next to every edited original.
+#[test]
+fn confinement_refuses_a_library_that_writes_sidecars_automatically() {
+    let mut h = Headless::default();
+    h.session.xmp.auto_write = true;
+    let dir = std::env::temp_dir();
+    assert!(h.confine(crate::Confinement::new(std::slice::from_ref(&dir), &[]).unwrap()).is_err());
+}

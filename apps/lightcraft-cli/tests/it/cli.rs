@@ -1152,3 +1152,30 @@ fn denoise_serve_runs_tiles_for_another_computer() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&models);
 }
+
+/// `mcp --automation-read-root/--automation-write-root`: the roots confine the headless server
+/// only, and the library and start-up files must be inside them.
+#[test]
+fn mcp_confinement_options_are_checked_at_start() {
+    let base = tmp("mcp-confine");
+    let _ = std::fs::remove_dir_all(&base);
+    let (inside, outside) = (base.join("in"), base.join("other"));
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let run = |args: &[&std::ffi::OsStr]| Command::new(binary()).arg("mcp").args(args).stdin(std::process::Stdio::null()).output().unwrap();
+    // with --connect: refused
+    let o = run(&["--connect".as_ref(), "--automation-read-root".as_ref(), inside.as_os_str()]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("headless server only"), "{o:?}");
+    // a library outside the write roots: refused before it is created
+    let lib = outside.join("lib");
+    let o = run(&["--library".as_ref(), lib.as_os_str(), "--automation-write-root".as_ref(), inside.as_os_str()]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("file access is confined"), "{o:?}");
+    assert!(!lib.exists());
+    // a root that does not exist: refused
+    let o = run(&["--automation-read-root".as_ref(), base.join("missing").as_os_str()]);
+    assert!(!o.status.success(), "{o:?}");
+    // a library inside the write root: serves (and ends at the end of stdin)
+    let o = run(&["--library".as_ref(), inside.join("lib").as_os_str(), "--automation-write-root".as_ref(), inside.as_os_str()]);
+    assert!(o.status.success(), "{o:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}

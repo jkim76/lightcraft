@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::backend::Backend;
 use crate::base64::base64_encode;
+use crate::confine::Access;
 use crate::headless::{encode_image, expand_paths};
 
 /// Prefix of the tools generated from the command registry.
@@ -145,6 +146,7 @@ pub fn helper_tools(has_ui: bool) -> Vec<Value> {
             json!({
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Files and/or folders"},
                 "album": {"type": "integer", "description": "Also add to this album id"},
+                "albumName": {"type": "string", "description": "Also add to a new album of this name (when `album` is not given and something was imported)"},
                 "mode": {"type": "string", "enum": ["add", "copy", "move"], "description": "add (default) = reference the files in place; copy = copy them into `destination` (default: the library's Originals/); move = as copy, then each original and its XMP sidecars are removed from the source once the copy is verified and catalogued (duplicates and failures keep their sources; `kept` lists sources left in place and why; undo leaves the moved files at the destination)"},
                 "destination": {"type": "string", "description": "Copy or move: destination folder"},
                 "organize": {"type": "string", "description": "Copy or move: folders inside the destination — date (YYYY/YYYY-MM-DD, default), month (YYYY/YYYY-MM), flat, or a folder template such as {date:%Y}/{date:%Y%m%d} (→ 2026/20260114; the template's / make the levels, tokens as for rename; relative, no ..). Dated by capture time, else the import time"},
@@ -680,12 +682,17 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> ToolResult {
                 Some(Value::String(p)) => vec![p.clone()],
                 _ => return ToolResult::error("missing `paths`"),
             };
+            // a move removes the sources: they must be writable too
+            let access = if args.get("mode").and_then(Value::as_str) == Some("move") { Access::Write } else { Access::Read };
+            if let Err(e) = b.check_paths(&paths, access) {
+                return ToolResult::error(e);
+            }
             let files = expand_paths(&paths);
             if files.is_empty() {
                 return ToolResult::error(format!("no photos found in {paths:?}"));
             }
             let mut p = json!({"paths": files});
-            for k in ["album", "mode", "destination", "organize", "rename", "onDeleted"] {
+            for k in ["album", "albumName", "mode", "destination", "organize", "rename", "onDeleted"] {
                 if let Some(v) = args.get(k).filter(|v| !v.is_null()) {
                     p[k] = v.clone();
                 }

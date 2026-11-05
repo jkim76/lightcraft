@@ -20,6 +20,12 @@ pub trait Backend {
     fn describe(&self) -> String;
     /// Progress/cancellation for the next headless batch export. Other backends ignore it.
     fn set_progress(&mut self, _hook: Option<ProgressHook>) {}
+    /// Refuse paths outside the file access roots (`--automation-read-root` /
+    /// `--automation-write-root`) before a tool looks at them (the `import` tool lists folders
+    /// before it imports). Backends without confinement allow everything.
+    fn check_paths(&self, _paths: &[String], _access: crate::confine::Access) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// `(completed photos, total photos, next filename)`; false stops before the next photo.

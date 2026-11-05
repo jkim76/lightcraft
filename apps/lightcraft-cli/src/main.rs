@@ -18,11 +18,12 @@
 mod alloc_release;
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lightcraft_engine::Session;
-use lightcraft_mcp::{Backend, DEFAULT_ADDR, Headless, Remote, Server, expand_paths};
+use lightcraft_mcp::confine::Access;
+use lightcraft_mcp::{Backend, Confinement, DEFAULT_ADDR, Headless, Remote, Server, expand_paths};
 use serde_json::{Value, json};
 
 const USAGE: &str = "\
@@ -51,6 +52,11 @@ USAGE:
         --demo            headless: start with the procedurally generated demo library
         --library DIR     headless: open (or create) a persistent LightCraft library; edits are saved
         --compact         list only the helper tools (every command stays reachable via run_command)
+        --automation-read-root DIR   headless: confine the files agents may read to DIR (repeatable;
+                          also readable: the write roots)
+        --automation-write-root DIR  headless: confine the files agents may write to DIR (repeatable).
+                          With either, every command is checked: paths must be absolute and inside
+                          the roots, --library must be inside a write root (docs/mcp.md)
   lightcraft-cli render <IN> -o <OUT> [OPTIONS]
       Develop one file and export it (.jpg, .png, .tif, .webp, .avif, .jxl, .psd or .dng by extension) with the
       same encoder as the app's Export dialog. Options:
@@ -319,9 +325,12 @@ fn mcp(args: &[String]) -> Result<(), String> {
     let mut library: Option<String> = None;
     let mut compact = false;
     let mut files = Vec::new();
+    let (mut read_roots, mut write_roots) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--automation-read-root" => read_roots.push(PathBuf::from(take_value(args, &mut i, "--automation-read-root")?)),
+            "--automation-write-root" => write_roots.push(PathBuf::from(take_value(args, &mut i, "--automation-write-root")?)),
             "--connect" => {
                 // Optional address argument. A bare port (all digits) is taken as a port on the
                 // loopback default — matches the help's `--connect [ADDR]` hint alongside the
@@ -351,6 +360,11 @@ fn mcp(args: &[String]) -> Result<(), String> {
             if !files.is_empty() || demo || library.is_some() {
                 return Err("FILES, --demo and --library apply to headless mode only (import through the `import` tool instead)".into());
             }
+            if !read_roots.is_empty() || !write_roots.is_empty() {
+                return Err("--automation-read-root/--automation-write-root confine the headless server only; the desktop app \
+                     reached with --connect reads and writes as the user"
+                    .into());
+            }
             match Remote::connect(&addr) {
                 Ok(r) => {
                     eprintln!("lightcraft-cli mcp: connected to LightCraft at {addr}");
@@ -363,6 +377,7 @@ fn mcp(args: &[String]) -> Result<(), String> {
             }
         }
         None => {
+            let confinement = confinement(&read_roots, &write_roots, library.as_deref(), &files)?;
             let mut h = match &library {
                 Some(dir) => {
                     let mut h = Headless::default();
@@ -374,6 +389,9 @@ fn mcp(args: &[String]) -> Result<(), String> {
                 None if demo => Headless::demo(),
                 None => Headless::default(),
             };
+            if let Some(c) = confinement {
+                h.confine(c).map_err(|e| format!("--automation-read-root/--automation-write-root: {e}"))?;
+            }
             if !files.is_empty() {
                 let paths = expand_paths(&files);
                 let r = h.session.execute("library.import", &json!({"paths": paths})).map_err(|e| e.to_string())?;
@@ -385,6 +403,25 @@ fn mcp(args: &[String]) -> Result<(), String> {
     eprintln!("lightcraft-cli mcp: serving MCP on stdio ({})", backend.describe());
     let mut server = Server::new(backend).with_command_tools(!compact);
     server.serve_stdio(std::io::stdout()).map_err(|e| e.to_string())
+}
+
+/// File access confinement for `mcp`: `None` without roots. The library folder must be inside a
+/// write root (the server writes its catalog there) and the files imported at start inside a read
+/// or write root.
+fn confinement(read: &[PathBuf], write: &[PathBuf], library: Option<&str>, files: &[String]) -> Result<Option<Confinement>, String> {
+    if read.is_empty() && write.is_empty() {
+        return Ok(None);
+    }
+    let c = Confinement::new(read, write)?;
+    if let Some(dir) = library {
+        let abs = std::path::absolute(dir).map_err(|e| format!("--library {dir}: {e}"))?;
+        c.check_path("--library", &abs.to_string_lossy(), Access::Write)?;
+    }
+    for f in files {
+        let abs = std::path::absolute(f).map_err(|e| format!("{f}: {e}"))?;
+        c.check_path("file", &abs.to_string_lossy(), Access::Read)?;
+    }
+    Ok(Some(c))
 }
 
 fn merge(args: &[String]) -> Result<(), String> {
