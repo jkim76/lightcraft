@@ -699,3 +699,51 @@ fn confinement_refuses_a_library_that_writes_sidecars_automatically() {
     let dir = std::env::temp_dir();
     assert!(h.confine(crate::Confinement::new(std::slice::from_ref(&dir), &[]).unwrap()).is_err());
 }
+
+/// The upstream decoders take per-photo raw context. A confinement wrapper forwards it intact
+/// for granted paths, and does not call any decoder for an ungranted original.
+#[test]
+fn confined_loaders_forward_raw_context_only_for_granted_paths() {
+    use lightcraft_engine::media::{DenoiseSpec, RawDecode};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (base, mut h) = confined_fixture("decode-context");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    h.session.media.file_loader = Some(Arc::new(move |_, max, with: RawDecode<'_>| {
+        assert_eq!(max, 12);
+        assert!(with.outliers);
+        count.fetch_add(1, Ordering::SeqCst);
+        Err("inner file decoder".to_string())
+    }));
+    let count = calls.clone();
+    h.session.media.reduced_loader = Some(Arc::new(move |_, max, with: RawDecode<'_>| {
+        assert_eq!(max, 12);
+        assert!(with.outliers);
+        count.fetch_add(1, Ordering::SeqCst);
+        Err("inner reduced decoder".to_string())
+    }));
+    let count = calls.clone();
+    h.session.media.denoise.loader = Some(Arc::new(move |_, max, spec: &DenoiseSpec, with: RawDecode<'_>| {
+        assert_eq!(max, 12);
+        assert_eq!(spec.key, "retained context");
+        assert!(with.outliers);
+        count.fetch_add(1, Ordering::SeqCst);
+        Err("inner pair decoder".to_string())
+    }));
+    let c = Arc::new(crate::Confinement::new(&[base.join("in")], &[base.join("out")]).unwrap());
+    c.confine_loaders(&mut h.session);
+    let spec = DenoiseSpec { product: base.join("out/product"), key: "retained context".into(), make: None };
+    let denied = s(&base.join("other/original.raw"));
+    let raw = RawDecode { dcp: None, outliers: true };
+    assert!(h.session.media.file_loader.as_ref().unwrap()(&denied, 12, raw).unwrap_err().contains("confined"));
+    assert!(h.session.media.reduced_loader.as_ref().unwrap()(&denied, 12, raw).unwrap_err().contains("confined"));
+    assert!(h.session.media.denoise.loader.as_ref().unwrap()(&denied, 12, &spec, raw).unwrap_err().contains("confined"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let granted = s(&base.join("in/original.raw"));
+    assert_eq!(h.session.media.file_loader.as_ref().unwrap()(&granted, 12, raw).unwrap_err(), "inner file decoder");
+    assert_eq!(h.session.media.reduced_loader.as_ref().unwrap()(&granted, 12, raw).unwrap_err(), "inner reduced decoder");
+    assert_eq!(h.session.media.denoise.loader.as_ref().unwrap()(&granted, 12, &spec, raw).unwrap_err(), "inner pair decoder");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    std::fs::remove_dir_all(base).unwrap();
+}

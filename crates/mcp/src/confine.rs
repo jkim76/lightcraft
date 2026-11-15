@@ -277,20 +277,20 @@ impl Confinement {
         let media = &mut session.media;
         if let Some(inner) = media.file_loader.take() {
             let c = Arc::clone(self);
-            media.file_loader = Some(Arc::new(move |path: &str, max: usize| {
+            media.file_loader = Some(Arc::new(move |path: &str, max: usize, with: lightcraft_engine::media::RawDecode<'_>| {
                 if !c.allows(Path::new(path), Access::Read) {
                     return Err(refuse(path));
                 }
-                inner(path, max)
+                inner(path, max, with)
             }));
         }
         if let Some(inner) = media.reduced_loader.take() {
             let c = Arc::clone(self);
-            media.reduced_loader = Some(Arc::new(move |path: &str, max: usize| {
+            media.reduced_loader = Some(Arc::new(move |path: &str, max: usize, with: lightcraft_engine::media::RawDecode<'_>| {
                 if !c.allows(Path::new(path), Access::Read) {
                     return Err(refuse(path));
                 }
-                inner(path, max)
+                inner(path, max, with)
             }));
         }
         if let Some(inner) = media.file_probe.take() {
@@ -309,12 +309,14 @@ impl Confinement {
         }
         if let Some(inner) = media.denoise.loader.take() {
             let c = Arc::clone(self);
-            media.denoise.loader = Some(Arc::new(move |path: &str, max: usize, spec: &lightcraft_engine::media::DenoiseSpec| {
-                if !c.allows(Path::new(path), Access::Read) {
-                    return Err(refuse(path));
-                }
-                inner(path, max, spec)
-            }));
+            media.denoise.loader = Some(Arc::new(
+                move |path: &str, max: usize, spec: &lightcraft_engine::media::DenoiseSpec, with: lightcraft_engine::media::RawDecode<'_>| {
+                    if !c.allows(Path::new(path), Access::Read) {
+                        return Err(refuse(path));
+                    }
+                    inner(path, max, spec, with)
+                },
+            ));
         }
     }
 }
